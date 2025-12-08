@@ -3,29 +3,27 @@
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
+#include <omp.h> // Vital para OpenMP
 
 // === GESTIÓN DE MEMORIA ===
 
 Matrix* mat_init(int rows, int cols) {
     Matrix* m = (Matrix*)malloc(sizeof(Matrix));
+    if (!m) exit(1);
     m->rows = rows;
     m->cols = cols;
 
     // ALINEACIÓN DE MEMORIA (32 bytes para AVX)
-    // Reemplazamos calloc por posix_memalign + memset
+    // Usamos posix_memalign para que las direcciones de memoria sean amigables con AVX
     size_t size = rows * cols * sizeof(float);
-
-    // Aseguramos que el tamaño sea múltiplo de 32 bytes para evitar errores de alineación al final
-    // (Opcional, pero buena práctica en HPC estricto)
-
     if (posix_memalign((void**)&m->data, 32, size) != 0) {
         fprintf(stderr, "Error de memoria alineada\n");
         exit(1);
     }
 
-    // posix_memalign contiene basura, hay que limpiar a 0
+    // Limpiamos basura
     memset(m->data, 0, size);
-
     return m;
 }
 
@@ -37,37 +35,29 @@ void mat_free(Matrix* m) {
 }
 
 void mat_randomize(Matrix* m) {
-    // Inicialización He/Xavier simplificada para convergencia rápida
     float scale = sqrtf(2.0f / m->rows);
     for (int i = 0; i < m->rows * m->cols; i++) {
         m->data[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * scale;
     }
 }
 
-// === OPERACIONES CORE (OPTIMIZADAS PARA CACHÉ) ===
+// === OPERACIONES CORE (OPTIMIZADAS PARA OPENMP) ===
 
 // 1. MULTIPLICACIÓN ESTÁNDAR (Forward Prop)
 // C = A * B
-// Optimizaciones:
-// - Loop Interchange (i-k-j) para acceso lineal
-// - 'restrict' para permitir vectorización SIMD
 void mat_mul(const Matrix* restrict A, const Matrix* restrict B, Matrix* restrict C) {
-    // Validación rápida de dimensiones
-    if (A->cols != B->rows || C->rows != A->rows || C->cols != B->cols) {
-        fprintf(stderr, "Error Dim: Mul %dx%d * %dx%d -> %dx%d\n",
-                A->rows, A->cols, B->rows, B->cols, C->rows, C->cols);
-        exit(1);
-    }
-
-    // Limpiamos C (memset es ultra rápido)
+    // Limpieza rápida
     memset(C->data, 0, C->rows * C->cols * sizeof(float));
 
-    // Bucle optimizado i-k-j
+    // ESTRATEGIA: Paralelizar filas de A (Batch)
+    // schedule(static) es mejor porque todas las filas cuestan lo mismo procesar.
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < A->rows; i++) {
         for (int k = 0; k < A->cols; k++) {
-            float r = A->data[i * A->cols + k]; // Cacheamos valor de A
+            float r = A->data[i * A->cols + k];
 
-            // Bucle interno: Vectorizable automáticamente (-O3 -march=native)
+            // Bucle interno vectorizado por el compilador (AVX)
+            // No paralelizamos aquí para evitar overhead excesivo
             for (int j = 0; j < B->cols; j++) {
                 C->data[i * C->cols + j] += r * B->data[k * B->cols + j];
             }
@@ -75,70 +65,72 @@ void mat_mul(const Matrix* restrict A, const Matrix* restrict B, Matrix* restric
     }
 }
 
-// 2. MULTIPLICACIÓN CON TRANSPUESTA IMPLÍCITA (Backward Prop)
-// C = A^T * B
-// Optimizaciones:
-// - Evita malloc/free de la matriz transpuesta
-// - Lee A y B secuencialmente usando acumulación (k-i-j)
+// 2. MULTIPLICACIÓN A^T * B (Backward Prop - Gradientes)
+// ESTA ES LA CLAVE DEL RENDIMIENTO PARALELO
 void mat_mul_AtB(const Matrix* restrict A, const Matrix* restrict B, Matrix* restrict C) {
-    // Validación: A^T (cols x rows) * B (rows x cols_B)
-    // Por tanto, A->rows debe ser igual a B->rows (dimensión de contracción, ej. Batch Size)
-    if (A->rows != B->rows || C->rows != A->cols || C->cols != B->cols) {
-        fprintf(stderr, "Error Dim: Mul_AtB A(%dx%d)^T * B(%dx%d) -> C(%dx%d)\n",
-                A->rows, A->cols, B->rows, B->cols, C->rows, C->cols);
-        exit(1);
-    }
+    // No necesitamos memset si sobrescribimos todo, pero por seguridad:
+    // (En esta lógica calculamos la suma total y asignamos, así que memset es opcional pero seguro)
+    // memset(C->data, 0, C->rows * C->cols * sizeof(float));
 
-    memset(C->data, 0, C->rows * C->cols * sizeof(float));
+    // ESTRATEGIA: Paralelizar la SALIDA (i, j)
+    // A diferencia del secuencial, aquí iteramos sobre cada celda de la matriz de gradientes C.
+    // i: 0..Inputs (ej. 784)
+    // j: 0..Outputs (ej. 500)
+    // Total tareas: 392,000 -> Ideal para saturar 4, 8, 16 hilos.
 
-    // Estrategia k-i-j:
-    // k: Recorre la dimensión común (filas de A y B, ej. Batch Size)
-    // i: Recorre columnas de A (que son filas de A^T)
-    // j: Recorre columnas de B
-    for (int k = 0; k < A->rows; k++) {
-        for (int i = 0; i < A->cols; i++) {
-            float val_a = A->data[k * A->cols + i]; // Lectura secuencial de A
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int i = 0; i < A->cols; i++) {      // Filas de A^T
+        for (int j = 0; j < B->cols; j++) {  // Columnas de B
 
-            // Bucle interno vectorizable
-            for (int j = 0; j < B->cols; j++) {
-                // Acumulamos en C
-                C->data[i * C->cols + j] += val_a * B->data[k * B->cols + j];
+            float sum = 0.0f; // Acumulador privado para cada hilo
+
+            // Reducción sobre el Batch (k)
+            // Cada hilo procesa las 32 muestras del batch para su celda (i,j)
+            for (int k = 0; k < A->rows; k++) {
+                sum += A->data[k * A->cols + i] * B->data[k * B->cols + j];
             }
+
+            C->data[i * C->cols + j] = sum;
         }
     }
 }
 
-// === UTILIDADES MATEMÁTICAS ===
+// === UTILIDADES MATEMÁTICAS (Paralelizadas) ===
 
-// A = A + B
 void mat_add(Matrix* restrict A, const Matrix* restrict B) {
     int size = A->rows * A->cols;
-    // El compilador vectorizará esto gracias a 'restrict' y al acceso lineal
+
+    // Paralelismo simple de grano fino
+    #pragma omp parallel for
     for (int i = 0; i < size; i++) {
         A->data[i] += B->data[i];
     }
 }
 
-// A = A - B
 void mat_subtract(Matrix* restrict A, const Matrix* restrict B) {
     int size = A->rows * A->cols;
+
+    #pragma omp parallel for
     for (int i = 0; i < size; i++) {
         A->data[i] -= B->data[i];
     }
 }
 
-// === FUNCIONES DE ACTIVACIÓN ===
+// === FUNCIONES DE ACTIVACIÓN (Paralelizadas) ===
 
 void apply_sigmoid(Matrix* m) {
     int size = m->rows * m->cols;
+
+    #pragma omp parallel for
     for (int i = 0; i < size; i++) {
         m->data[i] = 1.0f / (1.0f + expf(-m->data[i]));
     }
 }
 
-// Calcula f'(x) basada en la salida 'm' y guarda el resultado en 'dest'
 void sigmoid_derivative(const Matrix* restrict m, Matrix* restrict dest) {
     int size = m->rows * m->cols;
+
+    #pragma omp parallel for
     for (int i = 0; i < size; i++) {
         float val = m->data[i];
         dest->data[i] = val * (1.0f - val);
@@ -146,17 +138,21 @@ void sigmoid_derivative(const Matrix* restrict m, Matrix* restrict dest) {
 }
 
 void apply_softmax(Matrix* m) {
-    // Softmax por fila (Batch processing)
+    // Softmax tiene dependencias por fila (max y sum), es difícil de paralelizar eficientemente
+    // con grano fino si el batch es pequeño.
+    // Paralelizamos solo las filas (Batch).
+
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < m->rows; i++) {
-        float max_val = -1e9; // -Infinito
+        float max_val = -1e9;
         int row_offset = i * m->cols;
 
-        // 1. Encontrar maximo para estabilidad numérica
+        // 1. Max
         for (int j = 0; j < m->cols; j++) {
             if (m->data[row_offset + j] > max_val) max_val = m->data[row_offset + j];
         }
 
-        // 2. Exponencial y suma
+        // 2. Exp + Sum
         float sum = 0.0f;
         for (int j = 0; j < m->cols; j++) {
             float val = expf(m->data[row_offset + j] - max_val);
@@ -164,16 +160,17 @@ void apply_softmax(Matrix* m) {
             sum += val;
         }
 
-        // 3. Normalización
+        // 3. Div
         for (int j = 0; j < m->cols; j++) {
             m->data[row_offset + j] /= sum;
         }
     }
 }
 
-// Función auxiliar (ya casi no la usamos gracias a AtB, pero útil para debug)
+// Auxiliar (ya no usada en ruta crítica, pero la dejamos)
 Matrix* mat_transpose(Matrix* A) {
     Matrix* T = mat_init(A->cols, A->rows);
+    #pragma omp parallel for collapse(2)
     for (int i = 0; i < A->rows; i++) {
         for (int j = 0; j < A->cols; j++) {
             T->data[j * T->cols + i] = A->data[i * A->cols + j];

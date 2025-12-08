@@ -64,7 +64,6 @@ void mat_mul(const Matrix* restrict A, const Matrix* restrict B, Matrix* restric
     memset(C->data, 0, C->rows * C->cols * sizeof(float));
 
     // Bucle optimizado i-k-j
-    #pragma omp parallel for schedule(static)
     for (int i = 0; i < A->rows; i++) {
         for (int k = 0; k < A->cols; k++) {
             float r = A->data[i * A->cols + k]; // Cacheamos valor de A
