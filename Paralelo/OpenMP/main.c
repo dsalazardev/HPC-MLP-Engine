@@ -28,20 +28,24 @@ int main() {
     printf("=== MLP CON OPENMP ===\n");
     printf("Threads OpenMP: %d\n", omp_get_max_threads());
 
-    // 1. Cargar Datos
+    // 1. Cargar Datos de Entrenamiento
     const char* TRAIN_IMG = "../../Dataset/archive/train-images.idx3-ubyte";
     const char* TRAIN_LBL = "../../Dataset/archive/train-labels.idx1-ubyte";
+    const char* TEST_IMG = "../../Dataset/archive/t10k-images.idx3-ubyte";
+    const char* TEST_LBL = "../../Dataset/archive/t10k-labels.idx1-ubyte";
 
     printf("Cargando dataset MNIST...\n");
     Matrix* X_train_full = mnist_load_images(TRAIN_IMG);
     Matrix* Y_train_full = mnist_load_labels(TRAIN_LBL);
+    Matrix* X_test = mnist_load_images(TEST_IMG);
+    Matrix* Y_test = mnist_load_labels(TEST_LBL);
 
-    if (X_train_full == NULL || Y_train_full == NULL) {
+    if (X_train_full == NULL || Y_train_full == NULL || X_test == NULL || Y_test == NULL) {
         printf("Error: Fallo al cargar los datos.\n");
         return 1;
     }
 
-    printf("Datos cargados: %d imagenes\n", X_train_full->rows);
+    printf("Datos cargados: %d train, %d test\n", X_train_full->rows, X_test->rows);
 
     // 2. Configuración
     // CLAVE: batch_size grande para justificar OpenMP
@@ -97,11 +101,76 @@ int main() {
     printf("\n=== ENTRENAMIENTO FINALIZADO ===\n");
     printf("Tiempo Total: %.4f segundos\n", time_total);
 
-    // 4. Limpieza
+    // 4. Evaluación en Test Set (procesando en batches)
+    printf("\nEvaluando modelo en conjunto de Test...\n");
+    int correct = 0;
+    int test_samples = X_test->rows;
+    int test_batches = (test_samples + batch_size - 1) / batch_size;  // Redondeo hacia arriba
+    
+    Matrix* X_test_batch = mat_init(batch_size, 784);
+    
+    for (int b = 0; b < test_batches; b++) {
+        int start_row = b * batch_size;
+        int current_batch_size = batch_size;
+        if (start_row + batch_size > test_samples) {
+            current_batch_size = test_samples - start_row;
+        }
+        
+        // Llenar batch de test
+        fill_batch(X_test_batch, X_test, start_row, current_batch_size);
+        
+        // Forward pass
+        Matrix* predictions = net_forward(net, X_test_batch);
+        
+        // Evaluar predicciones de este batch
+        for (int i = 0; i < current_batch_size; i++) {
+            int global_idx = start_row + i;
+            
+            // Encontrar índice predicho (argmax)
+            int pred_idx = 0;
+            float max_val = predictions->data[i * 10];
+            for (int j = 1; j < 10; j++) {
+                if (predictions->data[i * 10 + j] > max_val) {
+                    max_val = predictions->data[i * 10 + j];
+                    pred_idx = j;
+                }
+            }
+            
+            // Encontrar índice real (argmax de one-hot)
+            int real_idx = 0;
+            for (int j = 0; j < 10; j++) {
+                if (Y_test->data[global_idx * 10 + j] > 0.5f) {
+                    real_idx = j;
+                    break;
+                }
+            }
+            
+            if (pred_idx == real_idx) correct++;
+        }
+    }
+    
+    float accuracy = (float)correct / test_samples * 100.0f;
+    printf("Precision (Accuracy): %.2f%%\n", accuracy);
+
+    // 5. Resumen para Informe
+    printf("\n============================================================\n");
+    printf("RESUMEN PARA INFORME TECNICO\n");
+    printf("============================================================\n");
+    printf("Escenario: C Paralelo (OpenMP)\n");
+    printf("Threads:   %d\n", omp_get_max_threads());
+    printf("Batch Size: %d\n", batch_size);
+    printf("Tiempo Total: %.4f s\n", time_total);
+    printf("Accuracy:  %.2f%%\n", accuracy);
+    printf("============================================================\n");
+
+    // 6. Limpieza
     mat_free(X_train_full);
     mat_free(Y_train_full);
+    mat_free(X_test);
+    mat_free(Y_test);
     mat_free(X_batch);
     mat_free(Y_batch);
+    mat_free(X_test_batch);
     
     return 0;
 }

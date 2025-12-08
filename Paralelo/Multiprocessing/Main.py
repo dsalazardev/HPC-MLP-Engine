@@ -9,10 +9,10 @@ def main():
 
     # 1. Configuración de Hiperparámetros
     EPOCHS = 10
-    BATCH_SIZE = 32
+    BATCH_SIZE = 256
     LEARNING_RATE = 0.1
     LAYER_STRUCTURE = [784, 500, 10]
-    N_WORKERS = 4  # Número de procesos paralelos
+    N_WORKERS = 4  # Número de threads para NumPy/BLAS
 
     # Ruta al dataset
     DATASET_PATH = str(Path(__file__).resolve().parents[2] / 'Dataset' / 'archive')

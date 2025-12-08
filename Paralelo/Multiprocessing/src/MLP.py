@@ -1,15 +1,15 @@
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 import time
+import os
 from src.DenseLayer import DenseLayer
 from src.Activations import Activations
 
 
 class MLP:
     """
-    Perceptrón Multicapa con paralelización mediante ThreadPool.
-    Estrategia: Paralelizar el procesamiento de batches grandes
-    y aplicar gradientes de forma síncrona.
+    Perceptrón Multicapa con paralelización mediante NumPy/BLAS threads.
+    NumPy con OpenBLAS/MKL usa múltiples threads internamente para
+    operaciones matriciales (np.dot), logrando paralelismo real.
     """
 
     def __init__(self, layer_structure, learning_rate=0.01, n_workers=None):
@@ -26,14 +26,14 @@ class MLP:
             self.layers.append(layer)
 
     def forward(self, X):
-        """Forward pass secuencial (para predicción)"""
+        """Forward pass"""
         activation = X
         for layer in self.layers:
             activation = layer.forward_prop(activation)
         return activation
 
     def backward(self, X, y_true):
-        """Backpropagation secuencial"""
+        """Backpropagation"""
         y_pred = self.layers[-1].output_a
         output_gradient = y_pred - y_true
 
@@ -48,19 +48,18 @@ class MLP:
     def train(self, X_train, y_train, epochs, batch_size):
         """
         Entrenamiento con paralelización interna de NumPy.
-        NumPy con BLAS/LAPACK ya usa múltiples threads internamente.
+        NumPy con BLAS/OpenBLAS usa múltiples threads para np.dot
         """
         n_samples = X_train.shape[0]
 
-        print(f"=== ENTRENAMIENTO PARALELO (NumPy Optimizado) ===")
-        print(f"Workers NumPy internos: {self.n_workers}")
-        print(f"Épocas: {epochs}, Batch size: {batch_size}")
-
         # Configurar threads de NumPy/OpenBLAS
-        import os
         os.environ['OMP_NUM_THREADS'] = str(self.n_workers)
         os.environ['OPENBLAS_NUM_THREADS'] = str(self.n_workers)
         os.environ['MKL_NUM_THREADS'] = str(self.n_workers)
+
+        print(f"=== ENTRENAMIENTO PARALELO (NumPy + BLAS Threads) ===")
+        print(f"Threads NumPy/BLAS: {self.n_workers}")
+        print(f"Épocas: {epochs}, Batch size: {batch_size}")
 
         for epoch in range(epochs):
             epoch_start = time.time()
