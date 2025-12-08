@@ -46,7 +46,7 @@ int main() {
 
     // 2. Configuración de la Red
 
-    int batch_size = 32;
+    int batch_size = 256;
     int epochs = 10;
     float learning_rate = 0.1f;
     int topology[] = {784, 500, 10}; // 784 Inputs -> 128 Hidden -> 10 Outputs
