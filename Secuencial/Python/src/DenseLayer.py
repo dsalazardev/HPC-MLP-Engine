@@ -1,5 +1,5 @@
 import numpy as np
-from Activations import Activations
+from Secuencial.Python.src.Activations import Activations
 
 
 class DenseLayer:

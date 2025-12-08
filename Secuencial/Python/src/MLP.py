@@ -1,5 +1,5 @@
 import numpy as np
-from DenseLayer import DenseLayer
+from Secuencial.Python.src.DenseLayer import DenseLayer
 
 
 class MLP:
