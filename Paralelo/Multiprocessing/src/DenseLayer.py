@@ -1,5 +1,5 @@
 import numpy as np
-from Secuencial.Python.src.Activations import Activations
+from src.Activations import Activations
 
 
 class DenseLayer:
@@ -14,7 +14,6 @@ class DenseLayer:
         self.activation_type = activation_type
 
         # Inicialización de Pesos (He Initialization o Random pequeño)
-        # Random normal * 0.1 para romper simetría
         self.weights = np.random.randn(n_input, n_output) * 0.1
         self.biases = np.zeros((1, n_output))
 
@@ -23,7 +22,7 @@ class DenseLayer:
         self.output_z = None  # Z
         self.output_a = None  # A (activación)
 
-        # Gradientes (para debug o visualización)
+        # Gradientes
         self.d_weights = None
         self.d_biases = None
 
@@ -33,7 +32,7 @@ class DenseLayer:
         """
         self.input_cache = input_data
 
-        # Operación Matricial (GEMM) - El núcleo del HPC
+        # Operación Matricial (GEMM)
         self.output_z = np.dot(input_data, self.weights) + self.biases
 
         if self.activation_type == 'sigmoid':
@@ -48,35 +47,27 @@ class DenseLayer:
     def backward_prop(self, output_gradient, learning_rate):
         """
         Calcula gradientes y actualiza pesos.
-        Retorna: gradiente de entrada para la capa anterior (dE/dX).
+        Retorna: gradiente de entrada para la capa anterior.
         """
         batch_size = self.input_cache.shape[0]
 
-        # 1. Calcular dZ (Derivada de la activación)
+        # 1. Calcular dZ
         if self.activation_type == 'sigmoid':
-            # dE/dZ = dE/dA * dA/dZ
-            # dA/dZ = sigmoid'(Z)
             d_activation = Activations.sigmoid_derivative(self.output_z)
             dZ = output_gradient * d_activation
         elif self.activation_type == 'softmax':
-            # Asumimos que output_gradient YA es (Prediction - Target)
-            # Esto simplifica el cálculo para Softmax + CrossEntropy
             dZ = output_gradient
         else:
             dZ = output_gradient
 
-        # 2. Calcular Gradientes de Pesos y Bias
-        # dW = X^T . dZ
+        # 2. Calcular Gradientes
         self.d_weights = np.dot(self.input_cache.T, dZ)
-        # db = sum(dZ)
         self.d_biases = np.sum(dZ, axis=0, keepdims=True)
 
-        # 3. Calcular gradiente para propagar hacia atrás (dX)
-        # dX = dZ . W^T
+        # 3. Calcular gradiente para propagar
         input_gradient = np.dot(dZ, self.weights.T)
 
         # 4. Actualizar Pesos (SGD)
-        # w = w - lr * (dw / batch) -> Promediamos por batch
         self.weights -= learning_rate * (self.d_weights / batch_size)
         self.biases -= learning_rate * (self.d_biases / batch_size)
 
