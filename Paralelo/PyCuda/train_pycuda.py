@@ -51,7 +51,7 @@ def entrenar_mlp_pycuda(X_train, y_train, X_test, y_test,
     tiempos_device_to_host = []
     
     # --- Inicialización de pesos ---
-    print(f"\n🔧 Inicializando red con:")
+    print(f"\n[CONFIG] Inicializando red con:")
     print(f"   - Neuronas capa oculta: {H}")
     print(f"   - Batch size: {batch_size}")
     print(f"   - Épocas: {epochs}")
@@ -63,6 +63,8 @@ def entrenar_mlp_pycuda(X_train, y_train, X_test, y_test,
     b2 = np.zeros((S,), dtype=np.float32)
     
     # --- Kernels CUDA ---
+
+    # KERNELS PARA FORWARD PASS PARALELIZADO
     print("   - Compilando kernels CUDA...")
     kernel_multi = """
     __global__ void multi(float *X, float *W, float *Z, float *b, int M, int N, int K) {
@@ -124,15 +126,130 @@ def entrenar_mlp_pycuda(X_train, y_train, X_test, y_test,
         }
     }
     """
+
+    # KERNELS PARA BACKPROPAGATION PARALELIZADO
+
+    kernel_backprop_dz1 = """
+    __global__ void backprop_dz1(float *dz2, float *W2_T, float *z1, float *dz1, 
+                                int batch_size, int H, int S) {
+        int row = blockIdx.y * blockDim.y + threadIdx.y;
+        int col = blockIdx.x * blockDim.x + threadIdx.x;
+        
+        if (row < batch_size && col < H) {
+            // dz2 · W2^T
+            float sum = 0.0f;
+            for (int k = 0; k < S; ++k) {
+                sum += dz2[row * S + k] * W2_T[col * S + k];
+            }
+            
+            // * relu'(z1)
+            float relu_deriv = (z1[row * H + col] > 0.0f) ? 1.0f : 0.0f;
+            dz1[row * H + col] = sum * relu_deriv;
+        }
+    }
+    """
+
+    kernel_backprop_dw1 = """
+    __global__ void backprop_dw1(float *X_T, float *dz1, float *dW1, 
+                                int E, int batch_size, int H) {
+        int row = blockIdx.y * blockDim.y + threadIdx.y;
+        int col = blockIdx.x * blockDim.x + threadIdx.x;
+        
+        if (row < E && col < H) {
+            float sum = 0.0f;
+            for (int k = 0; k < batch_size; ++k) {
+                sum += X_T[row * batch_size + k] * dz1[k * H + col];
+            }
+            dW1[row * H + col] = sum;
+        }
+    }
+    """
+
+    kernel_reduce_db1 = """
+    __global__ void reduce_db1(float *dz1, float *db1, int batch_size, int H) {
+        extern __shared__ float shared[];
+        
+        int tid = threadIdx.x;
+        int col = blockIdx.x;
+        
+        if (col < H) {
+            float sum = 0.0f;
+            for (int i = tid; i < batch_size; i += blockDim.x) {
+                sum += dz1[i * H + col];
+            }
+            shared[tid] = sum;
+            __syncthreads();
+            
+            for (int s = blockDim.x/2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    shared[tid] += shared[tid + s];
+                }
+                __syncthreads();
+            }
+            
+            if (tid == 0) {
+                db1[col] = shared[0];
+            }
+        }
+    }
+    """
+
+    kernel_reduce_db2 = """
+    __global__ void reduce_db2(float *dz2, float *db2, int batch_size, int S) {
+        extern __shared__ float shared[];
+        
+        int tid = threadIdx.x;
+        int col = blockIdx.x;
+        
+        if (col < S) {
+            float sum = 0.0f;
+            for (int i = tid; i < batch_size; i += blockDim.x) {
+                sum += dz2[i * S + col];
+            }
+            shared[tid] = sum;
+            __syncthreads();
+            
+            for (int s = blockDim.x/2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    shared[tid] += shared[tid + s];
+                }
+                __syncthreads();
+            }
+            
+            if (tid == 0) {
+                db2[col] = shared[0];
+            }
+        }
+    }
+    """
+
+    kernel_transpose = """
+    __global__ void transpose(float *A, float *A_T, int M, int N) {
+        int row = blockIdx.y * blockDim.y + threadIdx.y;
+        int col = blockIdx.x * blockDim.x + threadIdx.x;
+        
+        if (row < M && col < N) {
+            A_T[col * M + row] = A[row * N + col];
+        }
+    }
+    """
     
     # Compilar módulo
-    mod = SourceModule(kernel_multi + kernel_relu + kernel_softmax + kernel_matmul, 
-                      options=["-allow-unsupported-compiler"])
+    mod = SourceModule(kernel_multi + kernel_relu + kernel_softmax + kernel_matmul +
+                   kernel_backprop_dz1 + kernel_backprop_dw1 + 
+                   kernel_reduce_db1 + kernel_reduce_db2 + kernel_transpose, 
+                  options=["-allow-unsupported-compiler"])
+    
     func_multi = mod.get_function("multi")
     func_relu = mod.get_function("relu")
     func_softmax = mod.get_function("softmax")
     func_matmul = mod.get_function("matmul")
-    
+    func_backprop_dz1 = mod.get_function("backprop_dz1")
+    func_backprop_dw1 = mod.get_function("backprop_dw1")
+    func_reduce_db1 = mod.get_function("reduce_db1")
+    func_reduce_db2 = mod.get_function("reduce_db2")
+    func_transpose = mod.get_function("transpose")
+
     # --- Reservar memoria GPU ---
     print("   - Reservando memoria GPU...")
     
@@ -144,12 +261,26 @@ def entrenar_mlp_pycuda(X_train, y_train, X_test, y_test,
     Z2_GPU = drv.mem_alloc(batch_size * S * 4)
     A2_GPU = drv.mem_alloc(batch_size * S * 4)
     
+    # Buffers para backprop
+    DZ2_GPU = drv.mem_alloc(batch_size * S * 4)
+    A1T_GPU = drv.mem_alloc(H * batch_size * 4)    
+    DW2_GPU = drv.mem_alloc(H * S * 4)
+    DW1_GPU = drv.mem_alloc(E * H * 4)
+    
     # Pesos y biases (tamaño fijo)
     W1_GPU = drv.mem_alloc(W1.nbytes)
     W2_GPU = drv.mem_alloc(W2.nbytes)
     b1_GPU = drv.mem_alloc(b1.nbytes)
     b2_GPU = drv.mem_alloc(b2.nbytes)
     
+    # Nuevos buffers para backprop paralelizado
+    W2_T = np.ascontiguousarray(W2.T.astype(np.float32))
+    W2T_GPU = drv.mem_alloc(W2_T.nbytes)
+
+    DZ1_GPU = drv.mem_alloc(batch_size * H * 4)
+    DB1_GPU = drv.mem_alloc(H * 4)
+    DB2_GPU = drv.mem_alloc(S * 4)
+    XT_GPU = drv.mem_alloc(batch_size * E * 4)
 
     start = drv.Event(); end = drv.Event()
     start.record()
@@ -158,16 +289,11 @@ def entrenar_mlp_pycuda(X_train, y_train, X_test, y_test,
     drv.memcpy_htod(W2_GPU, W2)
     drv.memcpy_htod(b1_GPU, b1)
     drv.memcpy_htod(b2_GPU, b2)
+    drv.memcpy_htod(W2T_GPU, W2_T)
 
     end.record(); end.synchronize()
     t_htod = start.time_till(end)
     tiempos_host_to_device.append(t_htod)
-    
-    # Buffers para backprop
-    DZ2_GPU = drv.mem_alloc(batch_size * S * 4)
-    A1T_GPU = drv.mem_alloc(H * batch_size * 4)    
-    DW2_GPU = drv.mem_alloc(H * S * 4)
-    DW1_GPU = drv.mem_alloc(E * H * 4)
     
     # Buffers en CPU
     z1 = np.zeros((batch_size, H), dtype=np.float32)
@@ -308,77 +434,120 @@ def entrenar_mlp_pycuda(X_train, y_train, X_test, y_test,
             dz2[:cur_bs] -= yb[:cur_bs]
             dz2[cur_bs:] = 0.0
             
+            # Copiar dz2 a GPU
             start = drv.Event(); end = drv.Event()
             start.record()
-
             drv.memcpy_htod(DZ2_GPU, dz2)
-            drv.memcpy_htod(A1T_GPU, a1.T.astype(np.float32))
-
             end.record(); end.synchronize()
-            t_htod = start.time_till(end) 
-            tiempos_host_to_device.append(t_htod)
-
-            start = drv.Event(); end = drv.Event()
-            start.record()
-
-            drv.memcpy_dtoh(a1, A1_GPU)
-
-            end.record(); end.synchronize()
-
-            t_dtoh = start.time_till(end) 
-            tiempos_device_to_host.append(t_dtoh)
-
+            tiempos_host_to_device.append(start.time_till(end))
             
-            # dW2 = A1^T · dz2
-
+            # Traer a1 desde GPU 
             start = drv.Event(); end = drv.Event()
             start.record()
-
+            drv.memcpy_dtoh(a1, A1_GPU)
+            end.record(); end.synchronize()
+            tiempos_device_to_host.append(start.time_till(end))
+            
+            # --- BACKPROPAGATION COMPLETO EN GPU ---
+            # Transponer A1 en GPU para calcular dW2
+            start = drv.Event(); end = drv.Event()
+            start.record()
+            func_transpose(A1_GPU, A1T_GPU, np.int32(batch_size), np.int32(H),
+                          block=block, grid=grid_for(batch_size, H))
+            end.record(); end.synchronize()
+            tiempos_kernels.append(start.time_till(end))
+            
+            # Transponer X en GPU para calcular dW1
+            start = drv.Event(); end = drv.Event()
+            start.record()
+            func_transpose(X_GPU, XT_GPU, np.int32(batch_size), np.int32(E),
+                          block=block, grid=grid_for(batch_size, E))
+            end.record(); end.synchronize()
+            tiempos_kernels.append(start.time_till(end))
+            
+            # Calcular dW2 = A1^T · dz2 (TODO EN GPU)
+            start = drv.Event(); end = drv.Event()
+            start.record()
             func_matmul(A1T_GPU, DZ2_GPU, DW2_GPU, 
                        np.int32(H), np.int32(batch_size), np.int32(S),
-                       block=block, grid=((S + block[0] - 1)//block[0], 
-                                          (H + block[1] - 1)//block[1]))
-            
+                       block=block, grid=grid_for(H, S))
             end.record(); end.synchronize()
-            t_kernel = start.time_till(end) 
-            tiempos_kernels.append(t_kernel)
-            
-            drv.Context.synchronize()
+            tiempos_kernels.append(start.time_till(end))
+
+            # Calcular dz1 = (dz2 · W2^T) * relu'(z1)
+            start = drv.Event(); end = drv.Event()
+            start.record()
+            func_backprop_dz1(DZ2_GPU, W2T_GPU, Z1_GPU, DZ1_GPU,
+                            np.int32(batch_size), np.int32(H), np.int32(S),
+                            block=block, grid=grid_for(batch_size, H))
+            end.record(); end.synchronize()
+            tiempos_kernels.append(start.time_till(end))
+
+            # Calcular dW1 = X^T · dz1
+            start = drv.Event(); end = drv.Event()
+            start.record()
+            func_backprop_dw1(XT_GPU, DZ1_GPU, DW1_GPU,
+                            np.int32(E), np.int32(batch_size), np.int32(H),
+                            block=block, grid=grid_for(E, H))
+            end.record(); end.synchronize()
+            tiempos_kernels.append(start.time_till(end))
+
+            # Calcular db1 = sum(dz1, axis=0)
+            start = drv.Event(); end = drv.Event()
+            start.record()
+            func_reduce_db1(DZ1_GPU, DB1_GPU, np.int32(batch_size), np.int32(H),
+                        block=(256, 1, 1), grid=(H, 1), shared=256*4)
+            end.record(); end.synchronize()
+            tiempos_kernels.append(start.time_till(end))
+
+            # Calcular db2 = sum(dz2, axis=0)
+            start = drv.Event(); end = drv.Event()
+            start.record()
+            func_reduce_db2(DZ2_GPU, DB2_GPU, np.int32(batch_size), np.int32(S),
+                        block=(256, 1, 1), grid=(S, 1), shared=256*4)
+            end.record(); end.synchronize()
+            tiempos_kernels.append(start.time_till(end))
+
+            # Traer gradientes a CPU
             DW2 = np.empty((H, S), dtype=np.float32)
+            DW1 = np.empty((E, H), dtype=np.float32)
+            DB1 = np.empty((H,), dtype=np.float32)
+            DB2 = np.empty((S,), dtype=np.float32)
+
             start = drv.Event(); end = drv.Event()
             start.record()
 
             drv.memcpy_dtoh(DW2, DW2_GPU)
+            drv.memcpy_dtoh(DW1, DW1_GPU)
+            drv.memcpy_dtoh(DB1, DB1_GPU)
+            drv.memcpy_dtoh(DB2, DB2_GPU)
 
             end.record(); end.synchronize()
             tiempos_device_to_host.append(start.time_till(end))
-
-            
-            # dW1 (en CPU por simplicidad)
-            da1 = dz2[:batch_size].dot(W2.T)
-            dz1 = da1 * (z1 > 0).astype(np.float32)
-            dW1 = Xb.T.dot(dz1)
-            db1 = np.sum(dz1, axis=0)
             
             # --- ACTUALIZACIÓN DE PESOS ---
             W2 -= learning_rate * (DW2 / batch_size) 
-            b2 -= learning_rate * (np.sum(dz2, axis=0) / batch_size)
-            W1 -= learning_rate * (dW1 / batch_size)
-            b1 -= learning_rate * (db1 / batch_size)
+            b2 -= learning_rate * (DB2 / batch_size)
+            W1 -= learning_rate * (DW1 / batch_size)
+            b1 -= learning_rate * (DB1 / batch_size)
+
+            # Actualizar W2 transpuesta en GPU
+            W2_T = np.ascontiguousarray(W2.T.astype(np.float32))
             
             # Actualizar pesos en GPU
 
-            start = drv.Event(); end = drv.Event()
-            start.record()
-
-            drv.memcpy_htod(W1_GPU, W1)
-            drv.memcpy_htod(W2_GPU, W2)
-            drv.memcpy_htod(b1_GPU, b1)
-            drv.memcpy_htod(b2_GPU, b2)
-
-            end.record(); end.synchronize()
-            t_htod = start.time_till(end) 
-            tiempos_host_to_device.append(t_htod)
+            # Actualizar pesos en GPU cada 5 pasos para reducir transferencias
+            if step % 5 == 0 or step == steps_per_epoch - 1:
+                start = drv.Event(); end = drv.Event()
+                start.record()
+                drv.memcpy_htod(W1_GPU, W1)
+                drv.memcpy_htod(W2_GPU, W2)
+                drv.memcpy_htod(b1_GPU, b1)
+                drv.memcpy_htod(b2_GPU, b2)
+                drv.memcpy_htod(W2T_GPU, W2_T) 
+                end.record(); end.synchronize()
+                t_htod = start.time_till(end) 
+                tiempos_host_to_device.append(t_htod)
         
         # --- FIN DE EPOCH ---
         epoch_end = time.perf_counter()
@@ -408,7 +577,7 @@ def entrenar_mlp_pycuda(X_train, y_train, X_test, y_test,
     
     # --- PROFILING DETALLADO ---
     print("\n" + "=" * 60)
-    print("📊 PROFILING DETALLADO - Batch Size =", batch_size)
+    print("[PROFILING] Detallado  - Batch Size =", batch_size)
     print("=" * 60)
     
     if tiempos_kernels and tiempos_host_to_device and tiempos_device_to_host:
@@ -429,11 +598,11 @@ def entrenar_mlp_pycuda(X_train, y_train, X_test, y_test,
             tiempos_kernels, tiempos_host_to_device, tiempos_device_to_host, batch_size
         )
     else:
-        print("⚠️  No se pudieron medir todos los tiempos de profiling")
+        print("[WARN] No se pudieron medir todos los tiempos de profiling")
         datos_profiling = None
     
     # --- LIMPIAR MEMORIA GPU ---
-    print("\n🧹 Limpiando memoria GPU...")
+    print("\n[CLEAN] Limpiando memoria GPU...")
     X_GPU.free()
     Z1_GPU.free()
     A1_GPU.free()
@@ -447,6 +616,11 @@ def entrenar_mlp_pycuda(X_train, y_train, X_test, y_test,
     A1T_GPU.free()
     DW2_GPU.free()
     DW1_GPU.free()
+    W2T_GPU.free()
+    DZ1_GPU.free()
+    DB1_GPU.free()
+    DB2_GPU.free()
+    XT_GPU.free()
     
     # --- RETORNAR RESULTADOS ---
     return {
@@ -513,12 +687,12 @@ def analizar_batch_sizes(X_train, y_train, X_test, y_test,
             resultados.append(resultado)
             
             # Mostrar resumen
-            print(f"   ✅ Tiempo por epoch: {resultado['tiempo_por_epoch']:.2f}s")
-            print(f"   ✅ Accuracy test final: {resultado['accuracy_final_test']:.4f}")
-            print(f"   ✅ Tiempo total: {resultado['tiempo_total']:.2f}s")
+            print(f"   [OK] Tiempo por epoch: {resultado['tiempo_por_epoch']:.2f}s")
+            print(f"   [OK] Accuracy test final: {resultado['accuracy_final_test']:.4f}")
+            print(f"   [OK] Tiempo total: {resultado['tiempo_total']:.2f}s")
             
         except Exception as e:
-            print(f"   ❌ Error con batch_size={bs}: {e}")
+            print(f"   [ERROR] Error con batch_size={bs}: {e}")
             resultados.append({
                 'batch_size': bs,
                 'tiempo_por_epoch': None,
@@ -555,15 +729,15 @@ def ejecutar_comparacion_principal():
     Ejecuta la comparación principal con 10 epochs (como sugiere el documento)
     """
     # Cargar datos
-    dataset_dir = r"Dataset\archive"
+    dataset_dir = r"D:\Universidad de Caldas\Septimo semestre\Programacion concurrente y distribuida\ProyectoPrueba\dataset"
     
-    print("📂 Cargando dataset MNIST...")
+    print("[LOAD] Cargando dataset MNIST...")
     X_train = load_mnist_images(os.path.join(dataset_dir, 'train-images.idx3-ubyte'))
     y_train = load_mnist_labels(os.path.join(dataset_dir, 'train-labels.idx1-ubyte'))
     X_test = load_mnist_images(os.path.join(dataset_dir, 't10k-images.idx3-ubyte'))
     y_test = load_mnist_labels(os.path.join(dataset_dir, 't10k-labels.idx1-ubyte'))
     
-    print("✅ Datos cargados correctamente")
+    print("[OK] Datos cargados correctamente")
     print(f"   X_train: {X_train.shape}, y_train: {y_train.shape}")
     print(f"   X_test: {X_test.shape}, y_test: {y_test.shape}")
     
@@ -575,8 +749,8 @@ def ejecutar_comparacion_principal():
     
     resultado_principal = entrenar_mlp_pycuda(
         X_train, y_train, X_test, y_test,
-        epochs=10,  # Como sugiere el documento
-        batch_size=32,  # Valor intermedio
+        epochs=10,  
+        batch_size=32, 
         hidden_neurons=256,
         learning_rate=0.1
     )
@@ -640,9 +814,9 @@ def guardar_resultados(resultado_principal, df_resultados):
         
         plt.tight_layout()
         plt.savefig("resultados/grafica_batch_size.png", dpi=150)
-        print("\n📊 Gráfica guardada en: resultados/grafica_batch_size.png")
+        print("\n[GRAPH] Gráfica guardada en: resultados/grafica_batch_size.png")
     
-    print("\n💾 Resultados guardados en carpeta 'resultados/'")
+    print("\n[SAVE] Resultados guardados en carpeta 'resultados/'")
 
 
 # ============================================================================
@@ -655,7 +829,7 @@ def crear_grafica_profiling_detallado(tiempos_kernels, tiempos_host_to_device, t
     import matplotlib.pyplot as plt
     
     if not tiempos_kernels or not tiempos_host_to_device or not tiempos_device_to_host:
-        print("⚠️  No hay datos suficientes para crear gráfica de profiling")
+        print("[WARN] No hay datos suficientes para crear gráfica de profiling")
         return
     
     # Calcular promedios en ms
@@ -703,7 +877,7 @@ def crear_grafica_profiling_detallado(tiempos_kernels, tiempos_host_to_device, t
     plt.savefig(f'resultados/profiling/profiling_batch_{batch_size}.png', dpi=150, bbox_inches='tight')
     plt.close()
     
-    print(f"📈 Gráfica de profiling guardada: resultados/profiling/profiling_batch_{batch_size}.png")
+    print(f"[GRAPH] Gráfica de profiling guardada: resultados/profiling/profiling_batch_{batch_size}.png")
     
     return {
         'batch_size': batch_size,
@@ -722,7 +896,7 @@ def crear_grafica_profiling_detallado(tiempos_kernels, tiempos_host_to_device, t
 # 7. EJECUCIÓN PRINCIPAL
 # ============================================================================
 if __name__ == "__main__":
-    print("🚀 PROYECTO: IMPLEMENTACIÓN Y PARALELIZACIÓN DE MLP CON PyCUDA")
+    print("[START] PROYECTO: IMPLEMENTACIÓN Y PARALELIZACIÓN DE MLP CON PyCUDA")
     print("=" * 70)
     
     # Opción 1: Ejecutar comparación completa
@@ -735,5 +909,5 @@ if __name__ == "__main__":
     #                                 epochs=10, batch_size=32)
     
     print("\n" + "=" * 70)
-    print("✅ EJECUCIÓN COMPLETADA")
+    print("[DONE] EJECUCIÓN COMPLETADA")
     print("=" * 70)
