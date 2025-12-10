@@ -1,21 +1,41 @@
 """
-MLP con Paralelización usando multiprocessing.Pool
+MLP con Paralelización usando multiprocessing + SHARED MEMORY
 
-Estrategia: PARALELIZAR FORWARD Y BACKWARD POR BATCH
-- El batch se divide entre workers
-- Cada worker procesa su porción del batch completa (forward+backward)
-- Se agregan gradientes y se actualizan pesos
+Estrategia: Usar memoria compartida para EVITAR serialización de arrays.
+- Los datos de entrenamiento se copian UNA vez a memoria compartida
+- Los workers acceden directamente sin pickle/unpickle
+- Solo se sincronizan los gradientes (pequeños comparado con datos)
 
-Esto usa procesos separados para el cómputo, evitando el GIL.
+Esto elimina el cuello de botella de IPC.
 """
 
 import numpy as np
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, RawArray
+import ctypes
+
+# Variables globales para memoria compartida
+_shared_X = None
+_shared_y = None
+_shared_X_shape = None
+_shared_y_shape = None
+_shared_indices = None
 
 
-# =============================================================================
-# FUNCIONES WORKER (nivel módulo para pickle)
-# =============================================================================
+def _init_worker(shared_X, X_shape, shared_y, y_shape):
+    """Inicializador de workers - recibe referencias a memoria compartida."""
+    global _shared_X, _shared_y, _shared_X_shape, _shared_y_shape
+    _shared_X = shared_X
+    _shared_y = shared_y
+    _shared_X_shape = X_shape
+    _shared_y_shape = y_shape
+
+
+def _get_shared_arrays():
+    """Obtiene arrays numpy de la memoria compartida (vista, sin copia)."""
+    X = np.frombuffer(_shared_X, dtype=np.float64).reshape(_shared_X_shape)
+    y = np.frombuffer(_shared_y, dtype=np.float64).reshape(_shared_y_shape)
+    return X, y
+
 
 def _sigmoid(x):
     """Sigmoid vectorizada"""
@@ -28,17 +48,25 @@ def _softmax(x):
     return exps / np.sum(exps, axis=1, keepdims=True)
 
 
-def _worker_forward_backward(args):
+def _worker_compute_gradients(args):
     """
-    Worker que procesa un sub-batch completo.
+    Worker que computa gradientes para un rango de índices.
     
-    Hace forward y backward para su porción de datos.
-    Retorna los gradientes para agregar.
+    Lee datos de MEMORIA COMPARTIDA (sin serialización).
+    Solo recibe: índices, pesos (pequeños), configuración.
     """
-    X_chunk, y_chunk, weights, biases, activations_types = args
+    indices, weights, biases, activation_types = args
+    
+    # Obtener datos de memoria compartida (VISTA, sin copia)
+    X_full, y_full = _get_shared_arrays()
+    X_chunk = X_full[indices]
+    y_chunk = y_full[indices]
     
     n_layers = len(weights)
     batch_size = X_chunk.shape[0]
+    
+    if batch_size == 0:
+        return None
     
     # === FORWARD PASS ===
     layer_inputs = [X_chunk]
@@ -49,9 +77,9 @@ def _worker_forward_backward(args):
         Z = np.dot(A, weights[i]) + biases[i]
         Z_values.append(Z)
         
-        if activations_types[i] == 'sigmoid':
+        if activation_types[i] == 'sigmoid':
             A = _sigmoid(Z)
-        elif activations_types[i] == 'softmax':
+        elif activation_types[i] == 'softmax':
             A = _softmax(Z)
         
         layer_inputs.append(A)
@@ -67,23 +95,20 @@ def _worker_forward_backward(args):
     dW_list = []
     db_list = []
     
-    # Gradiente inicial (softmax + cross-entropy)
     dZ = y_pred - y_chunk
     
     for i in range(n_layers - 1, -1, -1):
         A_prev = layer_inputs[i]
         
-        # Gradientes
         dW = np.dot(A_prev.T, dZ)
         db = np.sum(dZ, axis=0, keepdims=True)
         
         dW_list.insert(0, dW)
         db_list.insert(0, db)
         
-        # Propagar hacia atrás
         if i > 0:
             dA = np.dot(dZ, weights[i].T)
-            if activations_types[i-1] == 'sigmoid':
+            if activation_types[i-1] == 'sigmoid':
                 s = _sigmoid(Z_values[i-1])
                 dZ = dA * s * (1 - s)
             else:
@@ -92,15 +117,11 @@ def _worker_forward_backward(args):
     return dW_list, db_list, loss, batch_size
 
 
-# =============================================================================
-# CLASE MLP
-# =============================================================================
-
 class MLP:
     """
-    Perceptrón Multicapa con paralelización usando multiprocessing.Pool
+    MLP con multiprocessing y MEMORIA COMPARTIDA.
     
-    Divide cada batch entre workers para forward/backward en paralelo.
+    Elimina el overhead de serialización usando RawArray.
     """
 
     def __init__(self, layer_structure, learning_rate=0.01, n_workers=None):
@@ -108,7 +129,6 @@ class MLP:
         self.n_workers = n_workers if n_workers else cpu_count()
         self.current_loss = 0.0
         
-        # Inicializar pesos
         self.weights = []
         self.biases = []
         self.activation_types = []
@@ -129,7 +149,7 @@ class MLP:
                 self.activation_types.append('sigmoid')
         
         print(f"MLP inicializado con {len(self.weights)} capas")
-        print(f"Usando {self.n_workers} workers")
+        print(f"Usando {self.n_workers} workers con MEMORIA COMPARTIDA")
 
     def forward(self, X):
         """Forward pass secuencial"""
@@ -149,65 +169,69 @@ class MLP:
 
     def train(self, X_train, y_train, epochs, batch_size):
         """
-        Entrenamiento con multiprocessing - MÍNIMO OVERHEAD.
+        Entrenamiento con MEMORIA COMPARTIDA.
         
-        Estrategia: Procesar múltiples batches por worker en cada llamada.
-        - Dividir época en N chunks (uno por worker)
-        - Cada worker procesa TODOS sus batches secuencialmente
-        - Sincronizar solo N_UPDATES veces por época
+        1. Copia datos a RawArray UNA vez al inicio
+        2. Workers acceden directamente (sin pickle de datos)
+        3. Solo se transfieren índices y gradientes
         """
         n_samples = X_train.shape[0]
-        n_updates_per_epoch = 30  # Sincronizaciones por época (ajustable)
+        n_batches = n_samples // batch_size
         
-        # Cuántas muestras procesa cada worker antes de sincronizar
-        samples_per_sync = n_samples // n_updates_per_epoch
-        samples_per_worker = samples_per_sync // self.n_workers
-        
-        print(f"\n=== ENTRENAMIENTO CON MULTIPROCESSING ===")
+        print(f"\n=== ENTRENAMIENTO CON SHARED MEMORY ===")
         print(f"Workers: {self.n_workers}")
         print(f"Épocas: {epochs}, Batch size: {batch_size}")
-        print(f"Samples: {n_samples}")
-        print(f"Sincronizaciones por época: {n_updates_per_epoch}")
-        print(f"Samples por worker por sync: {samples_per_worker}")
+        print(f"Samples: {n_samples}, Batches/época: {n_batches}")
         
-        with Pool(processes=self.n_workers) as pool:
+        # Crear memoria compartida para X e y (UNA vez)
+        X_flat = X_train.astype(np.float64).flatten()
+        y_flat = y_train.astype(np.float64).flatten()
+        
+        shared_X = RawArray(ctypes.c_double, X_flat.size)
+        shared_y = RawArray(ctypes.c_double, y_flat.size)
+        
+        # Copiar datos a memoria compartida
+        np.frombuffer(shared_X, dtype=np.float64)[:] = X_flat
+        np.frombuffer(shared_y, dtype=np.float64)[:] = y_flat
+        
+        print(f"Memoria compartida: {(X_flat.nbytes + y_flat.nbytes) / 1e6:.1f} MB")
+        
+        # Crear pool con inicializador (workers reciben referencia a memoria compartida)
+        with Pool(
+            processes=self.n_workers,
+            initializer=_init_worker,
+            initargs=(shared_X, X_train.shape, shared_y, y_train.shape)
+        ) as pool:
+            
             for epoch in range(epochs):
-                # Shuffle
+                # Shuffle índices
                 indices = np.arange(n_samples)
                 np.random.shuffle(indices)
-                X_shuffled = X_train[indices]
-                y_shuffled = y_train[indices]
                 
                 epoch_loss = 0.0
-                n_updates = 0
+                batches_done = 0
                 
-                # Procesar en chunks grandes (N_UPDATES por época)
-                for sync_idx in range(n_updates_per_epoch):
-                    sync_start = sync_idx * samples_per_sync
-                    sync_end = min((sync_idx + 1) * samples_per_sync, n_samples)
+                # Mini-batch loop
+                for batch_start in range(0, n_samples, batch_size):
+                    batch_end = min(batch_start + batch_size, n_samples)
+                    batch_indices = indices[batch_start:batch_end]
+                    current_batch_size = len(batch_indices)
                     
-                    X_sync = X_shuffled[sync_start:sync_end]
-                    y_sync = y_shuffled[sync_start:sync_end]
+                    # Dividir ÍNDICES entre workers (no datos)
+                    chunk_size = current_batch_size // self.n_workers
                     
-                    # Dividir entre workers
                     worker_args = []
-                    chunk_size = X_sync.shape[0] // self.n_workers
-                    
                     for w in range(self.n_workers):
                         w_start = w * chunk_size
-                        w_end = X_sync.shape[0] if w == self.n_workers - 1 else (w + 1) * chunk_size
+                        w_end = current_batch_size if w == self.n_workers - 1 else (w + 1) * chunk_size
                         
-                        args = (
-                            X_sync[w_start:w_end],
-                            y_sync[w_start:w_end],
-                            self.weights,
-                            self.biases,
-                            self.activation_types
-                        )
+                        # Solo enviamos ÍNDICES y pesos (pequeños)
+                        worker_indices = batch_indices[w_start:w_end]
+                        args = (worker_indices, self.weights, self.biases, self.activation_types)
                         worker_args.append(args)
                     
-                    # Ejecutar en paralelo (1 llamada a pool.map por sync)
-                    results = pool.map(_worker_forward_backward, worker_args)
+                    # Ejecutar en paralelo
+                    results = pool.map(_worker_compute_gradients, worker_args)
                     
                     # Agregar gradientes
                     accumulated_dW = [np.zeros_like(W) for W in self.weights]
@@ -215,7 +239,10 @@ class MLP:
                     total_loss = 0.0
                     total_samples = 0
                     
-                    for dW_list, db_list, loss, n_chunk in results:
+                    for result in results:
+                        if result is None:
+                            continue
+                        dW_list, db_list, loss, n_chunk = result
                         total_loss += loss * n_chunk
                         total_samples += n_chunk
                         
@@ -223,15 +250,15 @@ class MLP:
                             accumulated_dW[i] += dW_list[i]
                             accumulated_db[i] += db_list[i]
                     
-                    # Actualizar pesos
-                    for i in range(len(self.weights)):
-                        self.weights[i] -= self.learning_rate * (accumulated_dW[i] / total_samples)
-                        self.biases[i] -= self.learning_rate * (accumulated_db[i] / total_samples)
-                    
-                    epoch_loss += total_loss / total_samples
-                    n_updates += 1
+                    if total_samples > 0:
+                        for i in range(len(self.weights)):
+                            self.weights[i] -= self.learning_rate * (accumulated_dW[i] / total_samples)
+                            self.biases[i] -= self.learning_rate * (accumulated_db[i] / total_samples)
+                        
+                        epoch_loss += total_loss / total_samples
+                        batches_done += 1
                 
-                self.current_loss = epoch_loss / n_updates
+                self.current_loss = epoch_loss / batches_done if batches_done > 0 else 0
                 print(f"Epoch {epoch + 1}/{epochs} - Loss: {self.current_loss:.4f}")
 
     def predict(self, X_test):
