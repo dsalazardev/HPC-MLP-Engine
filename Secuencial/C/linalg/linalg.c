@@ -14,25 +14,37 @@ Matrix* mat_init(int rows, int cols) {
 
     // ALINEACIÓN DE MEMORIA (32 bytes para AVX)
     // Reemplazamos calloc por posix_memalign + memset
-    size_t size = rows * cols * sizeof(float);
+        size_t size = rows * cols * sizeof(float);
 
-    // Aseguramos que el tamaño sea múltiplo de 32 bytes para evitar errores de alineación al final
-    // (Opcional, pero buena práctica en HPC estricto)
+    #ifdef _WIN32
+        // Windows usa _aligned_malloc
+        m->data = _aligned_malloc(size, 32);
+        if (!m->data) {
+            fprintf(stderr, "Error de memoria alineada (Windows)\n");
+            exit(1);
+        }
+    #else
+        // Linux/macOS usan posix_memalign
+        if (posix_memalign((void**)&m->data, 32, size) != 0) {
+            fprintf(stderr, "Error de memoria alineada (POSIX)\n");
+            exit(1);
+        }
+    #endif
 
-    if (posix_memalign((void**)&m->data, 32, size) != 0) {
-        fprintf(stderr, "Error de memoria alineada\n");
-        exit(1);
-    }
+        memset(m->data, 0, size);
 
-    // posix_memalign contiene basura, hay que limpiar a 0
-    memset(m->data, 0, size);
 
     return m;
 }
 
 void mat_free(Matrix* m) {
     if (m) {
-        if (m->data) free(m->data);
+        #ifdef _WIN32
+            if (m->data) _aligned_free(m->data);
+        #else
+            if (m->data) free(m->data);
+        #endif
+
         free(m);
     }
 }

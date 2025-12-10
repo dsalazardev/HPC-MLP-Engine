@@ -52,7 +52,7 @@ int main() {
     int batch_size = 256;
     int epochs = 10;
     float learning_rate = 0.1f;
-    int topology[] = {784, 500, 10}; // 784 Inputs -> 128 Hidden -> 10 Outputs
+    int topology[] = {784, 256, 10}; // 784 Inputs -> 256 Hidden -> 10 Outputs
 
     printf("Inicializando red neural...\n");
     Network* net = net_create(topology, 3, learning_rate, batch_size);

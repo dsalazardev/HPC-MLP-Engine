@@ -9,9 +9,9 @@ def main():
 
     # 1. Configuración de Hiperparámetros
     EPOCHS = 10  # Requerido por el poyecto
-    BATCH_SIZE = 500 # Tamaño del bloque para actualización
+    BATCH_SIZE = 256 # Tamaño del bloque para actualización
     LEARNING_RATE = 0.1  # Tasa de aprendizaje
-    LAYER_STRUCTURE = [784, 500, 10]  # 784 (Input), 128 (Hidden), 10 (Output)
+    LAYER_STRUCTURE = [784, 256, 10]  # 784 (Input), 256 (Hidden), 10 (Output)
 
     # Ruta al dataset (ajusta según tu estructura de carpetas)
     DATASET_PATH = str(Path(__file__).resolve().parents[2] / 'Dataset' / 'archive')

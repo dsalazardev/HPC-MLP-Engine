@@ -36,9 +36,9 @@ def main():
     # CONFIGURACIÓN
     # =================================================================
     EPOCHS = 10
-    BATCH_SIZE = 250
+    BATCH_SIZE = 256
     LEARNING_RATE = 0.1
-    LAYER_STRUCTURE = [784, 250, 10]
+    LAYER_STRUCTURE = [784, 256, 10]
     WORKER_COUNTS = [1, 2, 4, 8, 16]  # Procesos a probar
     
     DATASET_PATH = str(Path(__file__).resolve().parents[2] / 'Dataset' / 'archive')

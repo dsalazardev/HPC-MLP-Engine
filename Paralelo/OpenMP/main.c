@@ -51,10 +51,10 @@ int main() {
     // CLAVE: batch_size grande para justificar OpenMP
     // Con batch_size=32, el overhead de threads mata el rendimiento
     // Con batch_size=256+, empezamos a ver beneficios
-    int batch_size = 256;  // AUMENTADO para mejor paralelismo
+    int batch_size = 256;
     int epochs = 10;
     float learning_rate = 0.1f;
-    int topology[] = {784, 500, 10};
+    int topology[] = {784, 256, 10};
 
     printf("Batch size: %d\n", batch_size);
     printf("Inicializando red neural...\n");

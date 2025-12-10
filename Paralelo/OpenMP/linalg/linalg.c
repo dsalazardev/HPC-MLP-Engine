@@ -6,6 +6,10 @@
 #include <math.h>
 #include <omp.h>
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 // === GESTIÓN DE MEMORIA ===
 
 Matrix* mat_init(int rows, int cols) {
@@ -15,17 +19,31 @@ Matrix* mat_init(int rows, int cols) {
     m->cols = cols;
 
     size_t size = rows * cols * sizeof(float);
-    if (posix_memalign((void**)&m->data, 32, size) != 0) {
-        fprintf(stderr, "Error de memoria alineada\n");
-        exit(1);
-    }
+
+    #ifdef _WIN32
+        m->data = _aligned_malloc(size, 32);
+        if (!m->data) {
+            fprintf(stderr, "Error de memoria alineada (Windows)\n");
+            exit(1);
+        }
+    #else
+        if (posix_memalign((void**)&m->data, 32, size) != 0) {
+            fprintf(stderr, "Error de memoria alineada (POSIX)\n");
+            exit(1);
+        }
+    #endif
+
     memset(m->data, 0, size);
     return m;
 }
 
 void mat_free(Matrix* m) {
     if (m) {
-        if (m->data) free(m->data);
+        #ifdef _WIN32
+            if (m->data) _aligned_free(m->data);
+        #else
+            if (m->data) free(m->data);
+        #endif
         free(m);
     }
 }
@@ -97,7 +115,7 @@ void mat_mul_AtB(const Matrix* restrict A, const Matrix* restrict B, Matrix* res
     float* restrict c_data = C->data;
     
     // Paralelizar cuando cols_A es grande (784 neuronas de entrada)
-    // Esta operación: 256 * 784 * 500 = 100M operaciones - ¡vale la pena!
+    // Esta operación: 256 * 784 * 500 = 100M operaciones 
     if (cols_A >= 500 && cols_B >= 10) {
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < cols_A; i++) {
