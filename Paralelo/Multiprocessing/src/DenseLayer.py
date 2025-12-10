@@ -1,5 +1,5 @@
 import numpy as np
-from src.Activations import Activations
+from Paralelo.Multiprocessing.src.Activations import Activations
 
 
 class DenseLayer:
@@ -13,7 +13,7 @@ class DenseLayer:
         self.n_output = n_output
         self.activation_type = activation_type
 
-        # Inicialización de Pesos (He Initialization o Random pequeño)
+        # Inicialización de Pesos (Random pequeño)
         self.weights = np.random.randn(n_input, n_output) * 0.1
         self.biases = np.zeros((1, n_output))
 
@@ -31,8 +31,6 @@ class DenseLayer:
         Calcula Z = X . W + B y aplica activación.
         """
         self.input_cache = input_data
-
-        # Operación Matricial (GEMM)
         self.output_z = np.dot(input_data, self.weights) + self.biases
 
         if self.activation_type == 'sigmoid':
@@ -47,11 +45,11 @@ class DenseLayer:
     def backward_prop(self, output_gradient, learning_rate):
         """
         Calcula gradientes y actualiza pesos.
-        Retorna: gradiente de entrada para la capa anterior.
+        Retorna: gradiente de entrada para la capa anterior (dE/dX).
         """
         batch_size = self.input_cache.shape[0]
 
-        # 1. Calcular dZ
+        # 1. Calcular dZ (Derivada de la activación)
         if self.activation_type == 'sigmoid':
             d_activation = Activations.sigmoid_derivative(self.output_z)
             dZ = output_gradient * d_activation
@@ -60,11 +58,11 @@ class DenseLayer:
         else:
             dZ = output_gradient
 
-        # 2. Calcular Gradientes
+        # 2. Calcular Gradientes de Pesos y Bias
         self.d_weights = np.dot(self.input_cache.T, dZ)
         self.d_biases = np.sum(dZ, axis=0, keepdims=True)
 
-        # 3. Calcular gradiente para propagar
+        # 3. Calcular gradiente para propagar hacia atrás (dX)
         input_gradient = np.dot(dZ, self.weights.T)
 
         # 4. Actualizar Pesos (SGD)
