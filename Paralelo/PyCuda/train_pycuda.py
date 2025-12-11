@@ -729,7 +729,7 @@ def ejecutar_comparacion_principal():
     Ejecuta la comparación principal con 10 epochs (como sugiere el documento)
     """
     # Cargar datos
-    dataset_dir = r"D:\Universidad de Caldas\Septimo semestre\Programacion concurrente y distribuida\ProyectoPrueba\dataset"
+    dataset_dir = r"D:\Universidad de Caldas\Septimo semestre\Programacion concurrente y distribuida\Proyecto\HPC-MLP-Engine\Dataset\archive"
     
     print("[LOAD] Cargando dataset MNIST...")
     X_train = load_mnist_images(os.path.join(dataset_dir, 'train-images.idx3-ubyte'))
